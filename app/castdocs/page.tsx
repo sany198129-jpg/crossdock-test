@@ -179,11 +179,13 @@ export default function CastdocsPage() {
     const remainder = orders.length % geCount;
     let orderIndex = 0;
     const generatedLabels: LabelData[] = [];
+    const geOrderCounts: number[] = [];
 
     for (let geIndex = 0; geIndex < geCount; geIndex += 1) {
       const ordersInGe = assembly
         ? ordersPerGe + (geIndex >= geCount - remainder ? 1 : 0)
         : 1;
+      geOrderCounts.push(ordersInGe);
       const currentGeOrders = assembly ? orders.slice(orderIndex, orderIndex + ordersInGe) : orders;
       orderIndex += ordersInGe;
 
@@ -222,14 +224,23 @@ export default function CastdocsPage() {
       });
     }
 
-    // Разбивка стоимости по заказам: сумма строго равна базовой стоимости перевозки
-    // и не может стать меньше её.
-    const orderCosts = getOrderCosts(
+    // Разбивка стоимости по заказам: перевозка оплачивается за целые ГЕ, поэтому
+    // сначала общая стоимость делится между ГЕ (пропорционально коэффициенту
+    // типоразмера), затем стоимость каждой ГЕ — поровну между заказами на ней.
+    // Наценки дробных типоразмеров на разбивку внутри ГЕ не влияют, а при отправке
+    // нескольких отдельных ГЕ-долей такая поставка стоит дороже одной паллеты.
+    // Сумма по заказам строго равна базовой стоимости и не может стать меньше её.
+    const geCostShares = getOrderCosts(
       cost,
-      generatedLabels.map((label) => label.orderPalletSizeCoefficient),
+      Array(geCount).fill(selectedPalletSize.coefficient),
     );
-    orderCosts.forEach((value, index) => {
-      generatedLabels[index].orderCost = value;
+    let labelCursor = 0;
+    geCostShares.forEach((geShare, geIndex) => {
+      const shares = getOrderCosts(geShare, Array(geOrderCounts[geIndex]).fill(1));
+      shares.forEach((value, offset) => {
+        generatedLabels[labelCursor + offset].orderCost = value;
+      });
+      labelCursor += geOrderCounts[geIndex];
     });
 
     barcodeRefs.current = [];

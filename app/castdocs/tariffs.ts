@@ -21,25 +21,25 @@ export const palletSizes: PalletSize[] = [
   { value: 'PAL_LONG', label: 'PAL_LONG — Длинномер (двери, МДФ), длина более 150 см до 240 см', coefficient: 2 },
   { value: 'PAL_PROF', label: 'PAL_PROF — Профили, столешницы, длинные изделия до 300 см', coefficient: 2.5 },
   { value: 'PAL_XL', label: 'PAL_XL — Особо габаритное, длинные товары до 360 см', coefficient: 3 },
-  // Дробные типоразмеры (доли стандартной европалеты). Введены для сборной поставки:
-  // заказам на общем ГЕ присваивается типоразмер, равный их доле на этом ГЕ.
-  // Доля каждого указана в названии: PAL_HALF — 1/2, PAL_THIRD — 1/3, PAL_QUARTER — 1/4,
-  // PAL_FIFTH — 1/5, PAL_SIXTH — 1/6, PAL_EIGHTH — 1/8.
-  { value: 'PAL_HALF', label: 'PAL_HALF — Половина паллеты (доля 1/2), 800×600 мм, до 500 кг', coefficient: 0.5, maxWeightKg: 500 },
-  { value: 'PAL_THIRD', label: 'PAL_THIRD — Треть паллеты (доля 1/3), до 333 кг', coefficient: 1 / 3, maxWeightKg: 333 },
-  { value: 'PAL_QUARTER', label: 'PAL_QUARTER — Четверть паллеты (доля 1/4), до 250 кг', coefficient: 0.25, maxWeightKg: 250 },
-  { value: 'PAL_FIFTH', label: 'PAL_FIFTH — Пятая часть паллеты (доля 1/5), до 200 кг', coefficient: 0.2, maxWeightKg: 200 },
-  { value: 'PAL_SIXTH', label: 'PAL_SIXTH — Шестая часть паллеты (доля 1/6), до 166 кг', coefficient: 1 / 6, maxWeightKg: 166 },
-  { value: 'PAL_EIGHTH', label: 'PAL_EIGHTH — Восьмая часть паллеты (доля 1/8), до 125 кг', coefficient: 0.125, maxWeightKg: 125 },
+  // Дробные типоразмеры (доли стандартной европалеты) для сборной поставки.
+  // Цены включают наценку против дробления: несколько отдельных долей стоят дороже
+  // одной целой паллеты — 2 × PAL_HALF = 1,1; 3 × PAL_THIRD = 1,11; 4 × PAL_QUARTER = 1,12
+  // при цене целой паллеты 1,0. Тот же принцип, что у BOX_STD (0,3 — чуть меньше 1/3):
+  // 4 коробки × 0,3 = 1,2 дороже паллеты, поэтому 4+ коробок выгоднее привезти одной паллетой.
+  { value: 'PAL_HALF', label: 'PAL_HALF — Половина паллеты (доля 1/2), 800×600 мм, до 500 кг', coefficient: 0.55, maxWeightKg: 500 },
+  { value: 'PAL_THIRD', label: 'PAL_THIRD — Треть паллеты (доля 1/3), до 333 кг', coefficient: 0.37, maxWeightKg: 333 },
+  { value: 'PAL_QUARTER', label: 'PAL_QUARTER — Четверть паллеты (доля 1/4), до 250 кг', coefficient: 0.28, maxWeightKg: 250 },
 ];
 
-// Типоразмеры-доли паллеты. Заказу присваивается существующий типоразмер из этого
-// списка, если его доля на ГЕ совпадает с ним по коэффициенту (независимо от базового
-// типа ГЕ: например, половина ГЕ PAL_HALF — это PAL_QUARTER, треть PAL_MIX — PAL_HALF).
-// Для остальных долей создаётся производный код вида PAL_STD_1_7 или PAL_FIN_1_2.
-const FRACTIONAL_SIZE_CODES = [
-  'PAL_HALF', 'PAL_THIRD', 'PAL_QUARTER', 'PAL_FIFTH', 'PAL_SIXTH', 'PAL_EIGHTH',
-];
+// Готовые коды-доли присваиваются заказам только на базовой европалете (коэффициент 1):
+// 2 заказа → PAL_HALF, 3 → PAL_THIRD, 4 → PAL_QUARTER. Сборная может лежать на любом
+// паллете (PAL_FIN, PAL_MIX…): там заказ получает производный код вида PAL_FIN_1_2,
+// коэффициент которого равен точной доле заказа (коэффициент базового паллета / N).
+const FRACTIONAL_SIZE_BY_DENOMINATOR: Record<number, string> = {
+  2: 'PAL_HALF',
+  3: 'PAL_THIRD',
+  4: 'PAL_QUARTER',
+};
 
 const SHARE_EPSILON = 1e-9;
 
@@ -52,8 +52,10 @@ function formatCoefficient(value: number): string {
 // на ГЕ с базовым типоразмером basePalletSize (например, 3 заказа на одном европалете → 1/3).
 // Порядок присвоения:
 // 1) доля 1/1 (целое ГЕ) — базовый типоразмер;
-// 2) доля совпадает по коэффициенту с типоразмером-долей из справочника — он;
-// 3) иначе — производный код «{база}_1_{N}» с комментарием доли в названии.
+// 2) базовая европалета (коэффициент 1) и доля 1/2, 1/3 или 1/4 — готовый типоразмер
+//    справочника (PAL_HALF / PAL_THIRD / PAL_QUARTER);
+// 3) иначе — производный код «{база}_1_{N}»: сборная может лежать на любом паллете,
+//    коэффициент производного кода равен точной доле заказа (коэффициент базы / N).
 export function getOrderPalletSize(
   basePalletSize: PalletSize,
   shareDenominator: number,
@@ -61,14 +63,16 @@ export function getOrderPalletSize(
   if (!Number.isInteger(shareDenominator) || shareDenominator <= 1) {
     return basePalletSize;
   }
-  const shareCoefficient = basePalletSize.coefficient / shareDenominator;
-  const matched = palletSizes.find(
-    (size) => FRACTIONAL_SIZE_CODES.includes(size.value)
-      && Math.abs(size.coefficient - shareCoefficient) < SHARE_EPSILON,
-  );
-  if (matched) {
-    return matched;
+  if (Math.abs(basePalletSize.coefficient - 1) < SHARE_EPSILON) {
+    const fractionalCode = FRACTIONAL_SIZE_BY_DENOMINATOR[shareDenominator];
+    const matched = fractionalCode
+      ? palletSizes.find((size) => size.value === fractionalCode)
+      : undefined;
+    if (matched) {
+      return matched;
+    }
   }
+  const shareCoefficient = basePalletSize.coefficient / shareDenominator;
   const code = `${basePalletSize.value}_1_${shareDenominator}`;
   return {
     value: code,
@@ -163,10 +167,11 @@ export function getTransportCost(
   return Math.round(geCount * sizeCoefficient * rate);
 }
 
-// Разбивает базовую стоимость перевозки между заказами пропорционально коэффициентам
-// их присвоенных типоразмеров. Гарантия: сумма по заказам в точности равна baseCost
-// (расчёт в копейках, остаток распределяется по первым заказам) — итог по заказам
-// не может стать меньше базовой стоимости.
+// Делит указанную стоимость между получателями пропорционально весам. Гарантия:
+// сумма по получателям в точности равна shareCost (расчёт в копейках, остаток
+// распределяется по первым получателям). Используется на двух уровнях:
+// сначала общая стоимость делится между ГЕ, затем стоимость каждой ГЕ —
+// между заказами, которые на ней размещены.
 export function getOrderCosts(
   baseCost: number,
   orderCoefficients: number[],
