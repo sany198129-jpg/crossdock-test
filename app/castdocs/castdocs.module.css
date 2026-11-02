@@ -388,6 +388,63 @@
   color: #d20b30;
 }
 
+.ordersEditor {
+  display: grid;
+  gap: 10px;
+  margin-top: -6px;
+  padding: 16px 18px;
+  border: 1px solid #e2e2e2;
+  border-left: 4px solid #df092f;
+  background: #fafafa;
+}
+
+.ordersEditorTitle {
+  font-size: 15px;
+  font-weight: 700;
+  line-height: 1.4;
+}
+
+.ordersRow {
+  display: grid;
+  grid-template-columns: minmax(170px, 1fr) minmax(240px, 1.3fr) minmax(110px, auto);
+  gap: 12px;
+  align-items: center;
+}
+
+.ordersRowName {
+  font-size: 15px;
+}
+
+.ordersRow select {
+  width: 100%;
+  min-height: 44px;
+  padding: 0 11px;
+  border: 2px solid #d5d7d7;
+  border-radius: 6px;
+  color: #333;
+  background: #fff;
+  font: inherit;
+  font-size: 15px;
+}
+
+.ordersRowCoef {
+  font-size: 14px;
+  color: #555;
+  white-space: nowrap;
+}
+
+.ordersGeHint {
+  margin: 2px 0 0;
+  font-size: 14px;
+  line-height: 1.45;
+  color: #444;
+}
+
+.ordersGeHintOver {
+  color: #8b001b;
+  font-weight: 700;
+}
+
 .labelSection {
   max-width: 860px;
   margin: 40px auto 60px 0;
@@ -743,6 +800,15 @@
     font-size: 12px;
   }
 
+  .ordersEditor {
+    padding: 12px;
+  }
+
+  .ordersRow {
+    grid-template-columns: 1fr;
+    gap: 6px;
+  }
+
   .labelSection {
     margin: 30px auto 40px;
   }
@@ -858,6 +924,18 @@
   font-weight: 700;
   font-size: 15px;
   line-height: 1.5;
+}
+
+.costSummaryHint {
+  margin: 10px 0 0;
+  font-size: 14px;
+  line-height: 1.5;
+  color: #444;
+}
+
+.costSummaryHintOver {
+  color: #8b001b;
+  font-weight: 700;
 }
 
 @media print {

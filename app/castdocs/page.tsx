@@ -7,11 +7,14 @@ import {
   getStoreCity,
   getPalletSize,
   getTransportCost,
-  getOrderPalletSize,
-  getOrderCosts,
+  getRouteRate,
+  getOrderCostForCoefficient,
+  suggestOrderSizes,
+  formatCoefficient,
   isDistributionCenter,
   palletSizes,
   type DistributionCenter,
+  type PalletSize,
 } from './tariffs';
 
 const storeCodes = Array.from({ length: 30 }, (_, index) => index + 1)
@@ -36,11 +39,78 @@ type LabelData = {
   geNumber: number;
   geTotal: number;
   orderShareText: string;
-  orderShareFraction: string;
   orderPalletSizeCode: string;
   orderPalletSizeLabel: string;
   orderPalletSizeCoefficient: number;
   orderCost: number;
+};
+
+type OrderPlanRow = {
+  key: string;
+  orderNumber: string;
+  geNumber: number;
+  positionInGe: number;
+  ordersInGe: number;
+  suggested: PalletSize;
+  chosen: PalletSize;
+};
+
+// Раскладка заказов по ГЕ с типоразмером каждого заказа. Используется и для
+// подсказки в форме, и при формировании этикеток — предложенные и фактические
+// типоразмеры всегда совпадают. В сборной поставке заказы распределяются по ГЕ
+// поровну, типоразмер каждого заказа подставляется по типоразмеру ГЕ (автоподбор
+// коробками) и может быть изменён поставщиком (choices — ручной выбор по ключу).
+const buildOrderPlan = (
+  orders: string[],
+  geCount: number,
+  basePalletSize: PalletSize,
+  assembly: boolean,
+  choices: Record<string, string>,
+): OrderPlanRow[] => {
+  if (!Number.isInteger(geCount) || geCount < 1 || orders.length === 0) {
+    return [];
+  }
+  const rows: OrderPlanRow[] = [];
+  if (!assembly) {
+    // Несборная поставка: один заказ занимает каждое целое ГЕ.
+    for (let geIndex = 0; geIndex < geCount; geIndex += 1) {
+      const key = `0:${orders[0]}@${geIndex + 1}`;
+      const override = choices[key] ? getPalletSize(choices[key]) : undefined;
+      rows.push({
+        key,
+        orderNumber: orders[0],
+        geNumber: geIndex + 1,
+        positionInGe: 1,
+        ordersInGe: 1,
+        suggested: basePalletSize,
+        chosen: override ?? basePalletSize,
+      });
+    }
+    return rows;
+  }
+  const ordersPerGe = Math.floor(orders.length / geCount);
+  const remainder = orders.length % geCount;
+  let orderIndex = 0;
+  for (let geIndex = 0; geIndex < geCount; geIndex += 1) {
+    const ordersInGe = ordersPerGe + (geIndex >= geCount - remainder ? 1 : 0);
+    const sizes = suggestOrderSizes(basePalletSize, ordersInGe);
+    for (let position = 0; position < ordersInGe; position += 1) {
+      const orderNumber = orders[orderIndex];
+      const key = `${orderIndex}:${orderNumber}`;
+      const override = choices[key] ? getPalletSize(choices[key]) : undefined;
+      rows.push({
+        key,
+        orderNumber,
+        geNumber: geIndex + 1,
+        positionInGe: position + 1,
+        ordersInGe,
+        suggested: sizes[position] ?? basePalletSize,
+        chosen: override ?? sizes[position] ?? basePalletSize,
+      });
+      orderIndex += 1;
+    }
+  }
+  return rows;
 };
 
 const formatDate = (date: string) => {
@@ -60,6 +130,12 @@ export default function CastdocsPage() {
   const [palletSizeCode, setPalletSizeCode] = useState('');
   const [geCount, setGeCount] = useState('');
   const [weightKg, setWeightKg] = useState('');
+  const [ordersText, setOrdersText] = useState('');
+  const [assemblyMode, setAssemblyMode] = useState('');
+  // Ручные выборы типоразмеров хранятся по контексту (режим · заказы · ГЕ · типоразмер
+  // паллет): при смене любого из них старые выборы перестают применяться, и
+  // автоподстановка по ГЕ действует заново — без сброса состояния в effect.
+  const [orderSizeChoicesByContext, setOrderSizeChoicesByContext] = useState<Record<string, Record<string, string>>>({});
   const barcodeRefs = useRef<Array<SVGSVGElement | null>>([]);
   const labelRef = useRef<HTMLElement>(null);
   const selectedStoreCity = getStoreCity(selectedStoreCode);
@@ -86,6 +162,50 @@ export default function CastdocsPage() {
   const minimumGeCount = weightWarning && weightLimitKg !== undefined && parsedWeightKg !== undefined
     ? Math.ceil(parsedWeightKg / weightLimitKg)
     : undefined;
+  // Живой черновик раскладки заказов по ГЕ — для подсказки типоразмеров в форме.
+  const parsedOrders = ordersText
+    .split(/\r?\n/)
+    .map((order) => order.trim())
+    .filter(Boolean);
+  const ordersKey = parsedOrders.join('\n');
+  const planBasePalletSize = selectedSize ?? getPalletSize('PAL_STD')!;
+  const choicesContext = `${assemblyMode !== 'no' ? 'A' : 'S'}|${ordersKey}|${geCount}|${palletSizeCode}`;
+  const orderSizeChoices = orderSizeChoicesByContext[choicesContext] ?? {};
+  const planRows = buildOrderPlan(
+    parsedOrders,
+    Number(geCount),
+    planBasePalletSize,
+    assemblyMode !== 'no',
+    orderSizeChoices,
+  );
+  const geSummaries = (() => {
+    const map = new Map<number, { sum: number; count: number }>();
+    planRows.forEach((row) => {
+      const entry = map.get(row.geNumber) ?? { sum: 0, count: 0 };
+      entry.sum += row.chosen.coefficient;
+      entry.count += 1;
+      map.set(row.geNumber, entry);
+    });
+    return Array.from(map.entries())
+      .sort((a, b) => a[0] - b[0])
+      .map(([geNumber, entry]) => {
+        const sum = Math.round(entry.sum * 100) / 100;
+        const target = planBasePalletSize.coefficient;
+        const targetText = `${planBasePalletSize.value} (${formatCoefficient(target)})`;
+        const sumText = formatCoefficient(sum);
+        let text: string;
+        let over = false;
+        if (sum > target + 1e-9) {
+          over = true;
+          text = `ГЕ №${geNumber}: сумма типоразмеров заказов ${sumText} больше ${targetText} — дробление дороже целого ГЕ.`;
+        } else if (sum < target - 1e-9) {
+          text = `ГЕ №${geNumber}: сумма типоразмеров заказов ${sumText} меньше ${targetText} — недогруз ГЕ.`;
+        } else {
+          text = `ГЕ №${geNumber}: сумма типоразмеров заказов ${sumText} — равна типоразмеру ГЕ ${targetText}.`;
+        }
+        return { geNumber, text, over };
+      });
+  })();
   const transportCost = selectedStoreCity && distributionCenter && geCount
     ? getTransportCost(
       selectedStoreCode,
@@ -126,7 +246,7 @@ export default function CastdocsPage() {
     const formData = new FormData(event.currentTarget);
     const storeCode = String(formData.get('gruz-pol') ?? '');
     const supplierCode = String(formData.get('gruz-otp') ?? '').trim();
-    const orders = String(formData.get('zak-num') ?? '')
+    const orders = ordersText
       .split(/\r?\n/)
       .map((order) => order.trim())
       .filter(Boolean);
@@ -154,10 +274,11 @@ export default function CastdocsPage() {
     const selectedCenter = selectedCenterValue;
     const storeCity = getStoreCity(storeCode);
     const cost = getTransportCost(storeCode, selectedCenter, palletSizeCode, geCount);
+    const rate = getRouteRate(storeCode, selectedCenter);
     const rcDate = String(formData.get('rc-date') ?? '');
     const storeDate = String(formData.get('mag-date') ?? '');
 
-    if (!storeCity || cost === undefined) {
+    if (!storeCity || cost === undefined || rate === undefined) {
       setLabels([]);
       setSubmissionMessage('Не удалось определить тариф для выбранного магазина и РЦ разгрузки.');
       return;
@@ -175,73 +296,37 @@ export default function CastdocsPage() {
       return;
     }
 
-    const ordersPerGe = Math.floor(orders.length / geCount);
-    const remainder = orders.length % geCount;
-    let orderIndex = 0;
-    const generatedLabels: LabelData[] = [];
-    const geOrderCounts: number[] = [];
+    // Раскладка заказов по ГЕ с типоразмером каждого заказа. Типоразмер подставлен
+    // по типоразмеру ГЕ (автоподбор коробками: 2 заказа → 0,6 + 0,4 = 1,0;
+    // 3 заказа → 0,4 + 0,3 + 0,3 = 1,0; 4 и больше → 0,3 × N — уже дороже паллеты)
+    // и мог быть изменён поставщиком в окне номеров заказов.
+    const plan = buildOrderPlan(orders, geCount, selectedPalletSize, assembly, orderSizeChoices);
 
-    for (let geIndex = 0; geIndex < geCount; geIndex += 1) {
-      const ordersInGe = assembly
-        ? ordersPerGe + (geIndex >= geCount - remainder ? 1 : 0)
-        : 1;
-      geOrderCounts.push(ordersInGe);
-      const currentGeOrders = assembly ? orders.slice(orderIndex, orderIndex + ordersInGe) : orders;
-      orderIndex += ordersInGe;
-
-      // Заказам присваивается типоразмер, равный их доле на этом ГЕ
-      // (целое ГЕ → базовый типоразмер; 1/2 → PAL_HALF; 1/3 → PAL_THIRD и т.д.).
-      const orderPalletSize = getOrderPalletSize(selectedPalletSize, ordersInGe);
-
-      currentGeOrders.forEach((orderNumber, orderPosition) => {
-        const labelNumber = orderPosition + 1;
-        const labelCode = `${storeCode}-${supplierCode}-${orderNumber}--${geIndex + 1}-${orderPalletSize.value}`;
-
-        generatedLabels.push({
-          storeCode,
-          distributionCenter: selectedCenter,
-          storeCity,
-          supplierCode,
-          assembly: assembly ? 'Да' : 'Нет',
-          orderNumber,
-          palletSizeLabel: selectedPalletSize.label,
-          weight: String(formData.get('ves-gruza') ?? '').trim(),
-          temperatureMode: formData.get('temp-rezim') === 'yes' ? 'Да' : 'Нет',
-          rcDate,
-          storeDate,
-          labelCode,
-          labelNumber,
-          labelTotal: currentGeOrders.length,
-          geNumber: geIndex + 1,
-          geTotal: geCount,
-          orderShareText: ordersInGe === 1 ? '1 ГЕ' : `1/${ordersInGe} ГЕ`,
-          orderShareFraction: `1/${ordersInGe}`,
-          orderPalletSizeCode: orderPalletSize.value,
-          orderPalletSizeLabel: orderPalletSize.label,
-          orderPalletSizeCoefficient: orderPalletSize.coefficient,
-          orderCost: 0,
-        });
-      });
-    }
-
-    // Разбивка стоимости по заказам: перевозка оплачивается за целые ГЕ, поэтому
-    // сначала общая стоимость делится между ГЕ (пропорционально коэффициенту
-    // типоразмера), затем стоимость каждой ГЕ — поровну между заказами на ней.
-    // Наценки дробных типоразмеров на разбивку внутри ГЕ не влияют, а при отправке
-    // нескольких отдельных ГЕ-долей такая поставка стоит дороже одной паллеты.
-    // Сумма по заказам строго равна базовой стоимости и не может стать меньше её.
-    const geCostShares = getOrderCosts(
-      cost,
-      Array(geCount).fill(selectedPalletSize.coefficient),
-    );
-    let labelCursor = 0;
-    geCostShares.forEach((geShare, geIndex) => {
-      const shares = getOrderCosts(geShare, Array(geOrderCounts[geIndex]).fill(1));
-      shares.forEach((value, offset) => {
-        generatedLabels[labelCursor + offset].orderCost = value;
-      });
-      labelCursor += geOrderCounts[geIndex];
-    });
+    const generatedLabels: LabelData[] = plan.map((row) => ({
+      storeCode,
+      distributionCenter: selectedCenter,
+      storeCity,
+      supplierCode,
+      assembly: assembly ? 'Да' : 'Нет',
+      orderNumber: row.orderNumber,
+      palletSizeLabel: selectedPalletSize.label,
+      weight: String(formData.get('ves-gruza') ?? '').trim(),
+      temperatureMode: formData.get('temp-rezim') === 'yes' ? 'Да' : 'Нет',
+      rcDate,
+      storeDate,
+      labelCode: `${storeCode}-${supplierCode}-${row.orderNumber}--${row.geNumber}-${row.chosen.value}`,
+      labelNumber: row.positionInGe,
+      labelTotal: row.ordersInGe,
+      geNumber: row.geNumber,
+      geTotal: geCount,
+      orderShareText: row.ordersInGe === 1
+        ? 'целое ГЕ'
+        : `коэффициент ${formatCoefficient(row.chosen.coefficient)}`,
+      orderPalletSizeCode: row.chosen.value,
+      orderPalletSizeLabel: row.chosen.label,
+      orderPalletSizeCoefficient: row.chosen.coefficient,
+      orderCost: getOrderCostForCoefficient(rate, row.chosen.coefficient),
+    }));
 
     barcodeRefs.current = [];
     setLabels(generatedLabels);
@@ -304,7 +389,15 @@ export default function CastdocsPage() {
             </label>
             <label className={styles.field}>
               <span>Сборная</span>
-              <select name="delivery-type" defaultValue="" required>
+              <select
+                name="delivery-type"
+                value={assemblyMode}
+                onChange={(event) => {
+                  setAssemblyMode(event.target.value);
+                  setSubmissionMessage('');
+                }}
+                required
+              >
                 <option value="">Выберите вариант</option>
                 <option value="yes">Да</option>
                 <option value="no">Нет</option>
@@ -312,8 +405,66 @@ export default function CastdocsPage() {
             </label>
             <label className={styles.field}>
               <span>Номера заказов (по одному в строке)</span>
-              <textarea name="zak-num" rows={3} placeholder="Введите номер каждого заказа с новой строки" required />
+              <textarea
+                name="zak-num"
+                rows={3}
+                value={ordersText}
+                onChange={(event) => {
+                  setOrdersText(event.target.value);
+                  setSubmissionMessage('');
+                }}
+                placeholder="Введите номер каждого заказа с новой строки"
+                required
+              />
             </label>
+            {planRows.length > 0 && (
+              <div className={styles.ordersEditor}>
+                <span className={styles.ordersEditorTitle}>
+                  Типоразмеры заказов — подставлены по типоразмеру ГЕ, при необходимости измените
+                </span>
+                {planRows.map((row) => (
+                  <label className={styles.ordersRow} key={row.key}>
+                    <span className={styles.ordersRowName}>
+                      Заказ {row.orderNumber} · ГЕ №{row.geNumber}
+                    </span>
+                    <select
+                      value={row.chosen.value}
+                      onChange={(event) => {
+                        const code = event.target.value;
+                        setOrderSizeChoicesByContext((previous) => ({
+                          ...previous,
+                          [choicesContext]: {
+                            ...(previous[choicesContext] ?? {}),
+                            [row.key]: code,
+                          },
+                        }));
+                      }}
+                    >
+                      {palletSizes.map((size) => (
+                        <option value={size.value} key={size.value}>
+                          {size.value} (коэф. {formatCoefficient(size.coefficient)})
+                        </option>
+                      ))}
+                    </select>
+                    <span className={styles.ordersRowCoef}>
+                      {row.chosen.value === row.suggested.value
+                        ? `коэф. ${formatCoefficient(row.chosen.coefficient)}`
+                        : 'изменён вручную'}
+                    </span>
+                  </label>
+                ))}
+                {geSummaries.map((summary) => (
+                  <p
+                    className={summary.over
+                      ? `${styles.ordersGeHint} ${styles.ordersGeHintOver}`
+                      : styles.ordersGeHint}
+                    key={summary.geNumber}
+                  >
+                    {summary.text}
+                  </p>
+                ))}
+              </div>
+            )}
             <label className={styles.field}>
               <span>Количество ГЕ</span>
               <input
@@ -430,10 +581,42 @@ export default function CastdocsPage() {
                 ))}
               </ul>
               <p className={styles.costSummaryTotal}>
-                Итого по заказам: {formatCost(labels.reduce((sum, label) => sum + label.orderCost, 0))} ₽ — равно базовой
-                стоимости перевозки ({baseCost !== null ? formatCost(baseCost) : 0} ₽); сумма по заказам не может
-                быть меньше базовой.
+                Итого по заказам: {formatCost(labels.reduce((sum, label) => sum + label.orderCost, 0))} ₽
               </p>
+              <p className={styles.costSummaryTotal}>
+                Стоимость перевозки ({labels[0].geTotal} ГЕ · {labels[0].palletSizeLabel.split('—')[0].trim()}):{' '}
+                {baseCost !== null ? formatCost(baseCost) : 0} ₽
+              </p>
+              {(() => {
+                const ordersKopecks = labels.reduce(
+                  (sum, label) => sum + Math.round(label.orderCost * 100),
+                  0,
+                );
+                const baseKopecks = baseCost !== null ? Math.round(baseCost * 100) : 0;
+                const difference = ordersKopecks - baseKopecks;
+                if (difference === 0) {
+                  return (
+                    <p className={styles.costSummaryHint}>
+                      Сумма по заказам равна стоимости перевозки: дробление уложилось в типоразмер ГЕ.
+                    </p>
+                  );
+                }
+                if (difference > 0) {
+                  return (
+                    <p className={`${styles.costSummaryHint} ${styles.costSummaryHintOver}`}>
+                      Дробление дороже целых ГЕ на {formatCost(difference / 100)} ₽ — поставщику
+                      выгоднее укрупнить типоразмеры заказов (например, взять паллету вместо
+                      коробок).
+                    </p>
+                  );
+                }
+                return (
+                  <p className={styles.costSummaryHint}>
+                    Сумма по заказам меньше стоимости перевозки на {formatCost(-difference / 100)} ₽
+                    (недогруз ГЕ).
+                  </p>
+                );
+              })()}
             </div>
             {labels.map((label, index) => (
             <article className={styles.shippingLabel} key={`${label.labelCode}-${label.labelNumber}`}>

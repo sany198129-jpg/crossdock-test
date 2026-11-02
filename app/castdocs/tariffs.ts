@@ -11,74 +11,115 @@ export type PalletSize = {
   maxWeightKg?: number;
 };
 
+// Типоразмеры — коэффициент к базовой европалете (PAL_STD = 1).
+//
+// Экономика дробления: заказы сборной поставки дробятся на коробки. Коэффициенты
+// коробок подобраны так, чтобы 2–3 коробки в сумме давали европаллету
+// (0,6 + 0,4 = 1,0; 0,4 + 0,3 + 0,3 = 1,0), а 4 коробки стоили дороже паллеты
+// (минимум 4 × 0,3 = 1,2 > 1,0). Поэтому далее 3 частей дробить невыгодно —
+// поставщику выгоднее выбрать типоразмер паллеты. Дробных «долей паллеты»
+// (1/2, 1/3, 1/4 …) в справочнике нет намеренно.
 export const palletSizes: PalletSize[] = [
   { value: 'BOX_STD', label: 'BOX_STD — Коробка, до 60×40×60 см, до 25 кг', coefficient: 0.3, maxWeightKg: 25 },
-  { value: 'BUNDLE', label: 'BUNDLE — Вязанка (негабарит), длина 60–150 см, до 25 кг', coefficient: 0.7, maxWeightKg: 25 },
+  { value: 'BOX_L', label: 'BOX_L — Большая коробка, до 60×40×80 см, до 40 кг', coefficient: 0.4, maxWeightKg: 40 },
   { value: 'BIG_BOX', label: 'BIG_BOX — Крупная коробка без поддона, основание до 800×600 мм, высота до 120 см, до 25 кг', coefficient: 0.6, maxWeightKg: 25 },
+  { value: 'BUNDLE', label: 'BUNDLE — Вязанка (негабарит), длина 60–150 см, до 25 кг', coefficient: 0.7, maxWeightKg: 25 },
   { value: 'PAL_STD', label: 'PAL_STD — Европалета стандарт, 800×1200 мм, высота до 180 см', coefficient: 1, maxWeightKg: 1000 },
   { value: 'PAL_FIN', label: 'PAL_FIN — Финская палета, 1000×1200 мм', coefficient: 1.2, maxWeightKg: 1000 },
   { value: 'PAL_MIX', label: 'PAL_MIX — Финская палета для смесей и ванн, 1000×1200 мм', coefficient: 1.5, maxWeightKg: 1000 },
   { value: 'PAL_LONG', label: 'PAL_LONG — Длинномер (двери, МДФ), длина более 150 см до 240 см', coefficient: 2 },
   { value: 'PAL_PROF', label: 'PAL_PROF — Профили, столешницы, длинные изделия до 300 см', coefficient: 2.5 },
   { value: 'PAL_XL', label: 'PAL_XL — Особо габаритное, длинные товары до 360 см', coefficient: 3 },
-  // Дробные типоразмеры (доли стандартной европалеты) для сборной поставки.
-  // Цены включают наценку против дробления: несколько отдельных долей стоят дороже
-  // одной целой паллеты — 2 × PAL_HALF = 1,1; 3 × PAL_THIRD = 1,11; 4 × PAL_QUARTER = 1,12
-  // при цене целой паллеты 1,0. Тот же принцип, что у BOX_STD (0,3 — чуть меньше 1/3):
-  // 4 коробки × 0,3 = 1,2 дороже паллеты, поэтому 4+ коробок выгоднее привезти одной паллетой.
-  { value: 'PAL_HALF', label: 'PAL_HALF — Половина паллеты (доля 1/2), 800×600 мм, до 500 кг', coefficient: 0.55, maxWeightKg: 500 },
-  { value: 'PAL_THIRD', label: 'PAL_THIRD — Треть паллеты (доля 1/3), до 333 кг', coefficient: 0.37, maxWeightKg: 333 },
-  { value: 'PAL_QUARTER', label: 'PAL_QUARTER — Четверть паллеты (доля 1/4), до 250 кг', coefficient: 0.28, maxWeightKg: 250 },
 ];
 
-// Готовые коды-доли присваиваются заказам только на базовой европалете (коэффициент 1):
-// 2 заказа → PAL_HALF, 3 → PAL_THIRD, 4 → PAL_QUARTER. Сборная может лежать на любом
-// паллете (PAL_FIN, PAL_MIX…): там заказ получает производный код вида PAL_FIN_1_2,
-// коэффициент которого равен точной доле заказа (коэффициент базового паллета / N).
-const FRACTIONAL_SIZE_BY_DENOMINATOR: Record<number, string> = {
-  2: 'PAL_HALF',
-  3: 'PAL_THIRD',
-  4: 'PAL_QUARTER',
-};
+// Семейство коробок, которыми система дробит заказы сборной на ГЕ.
+// 0,3 / 0,4 / 0,6 — разные коэффициенты, суммой дающие европаллету.
+const SPLIT_BOX_POOL = ['BOX_STD', 'BOX_L', 'BIG_BOX'];
 
-const SHARE_EPSILON = 1e-9;
+const COEFFICIENT_EPSILON = 1e-9;
 
 // Коэффициент для показа: запятая как десятичный разделитель, без лишних нулей.
-function formatCoefficient(value: number): string {
+export function formatCoefficient(value: number): string {
   return value.toFixed(4).replace(/0+$/, '').replace(/\.$/, '').replace('.', ',');
 }
 
-// Возвращает типоразмер, присваиваемый заказу, который занимает долю 1/shareDenominator
-// на ГЕ с базовым типоразмером basePalletSize (например, 3 заказа на одном европалете → 1/3).
-// Порядок присвоения:
-// 1) доля 1/1 (целое ГЕ) — базовый типоразмер;
-// 2) базовая европалета (коэффициент 1) и доля 1/2, 1/3 или 1/4 — готовый типоразмер
-//    справочника (PAL_HALF / PAL_THIRD / PAL_QUARTER);
-// 3) иначе — производный код «{база}_1_{N}»: сборная может лежать на любом паллете,
-//    коэффициент производного кода равен точной доле заказа (коэффициент базы / N).
-export function getOrderPalletSize(
+// Предлагаемые типоразмеры заказов, размещённых на одной ГЕ (автоподбор по ГЕ).
+//
+// 1 заказ  → целый ГЕ (типоразмер самого ГЕ);
+// 2 заказа → BIG_BOX (0,6) + BOX_L (0,4)           = 1,0 — ровно европаллета;
+// 3 заказа → BOX_L (0,4) + BOX_STD (0,3) + BOX_STD = 1,0 — ровно европаллета;
+// 4+ заказа→ коробок не хватает, берутся минимальные (0,3): сумма 1,2 и больше —
+//            дороже паллеты, интерфейс покажет предупреждение.
+// Для ГЕ с коэффициентом не 1 (PAL_FIN 1,2, PAL_MIX 1,5) подбор идёт к коэффициенту
+// этого ГЕ: PAL_FIN 2 заказа → 0,6 + 0,6 = 1,2; PAL_MIX 3 заказа → 0,6 + 0,6 + 0,3 = 1,5.
+// Поставщик может изменить предложенный типоразмер каждого заказа вручную.
+export function suggestOrderSizes(
   basePalletSize: PalletSize,
-  shareDenominator: number,
-): PalletSize {
-  if (!Number.isInteger(shareDenominator) || shareDenominator <= 1) {
-    return basePalletSize;
+  ordersInGe: number,
+): PalletSize[] {
+  if (!Number.isInteger(ordersInGe) || ordersInGe < 1) {
+    return [];
   }
-  if (Math.abs(basePalletSize.coefficient - 1) < SHARE_EPSILON) {
-    const fractionalCode = FRACTIONAL_SIZE_BY_DENOMINATOR[shareDenominator];
-    const matched = fractionalCode
-      ? palletSizes.find((size) => size.value === fractionalCode)
-      : undefined;
-    if (matched) {
-      return matched;
+  if (ordersInGe === 1) {
+    return [basePalletSize];
+  }
+
+  const pool = SPLIT_BOX_POOL
+    .map((code) => palletSizes.find((size) => size.value === code))
+    .filter((size): size is PalletSize => Boolean(size));
+
+  // Более 8 заказов на одном ГЕ не перебираем: минимальные коробки в любом случае
+  // превышают типоразмер ГЕ, что и покажет предупреждение о дорогом дроблении.
+  if (ordersInGe > 8) {
+    return Array.from({ length: ordersInGe }, () => pool[0]);
+  }
+
+  const target = basePalletSize.coefficient;
+  let bestCounts: number[] | null = null;
+  let bestDeviation = Infinity;
+  let bestSum = Infinity;
+  let bestBigCount = Infinity;
+
+  // Перебор комбинаций: counts[i] — сколько коробок типа i взять.
+  const enumerate = (poolIndex: number, remaining: number, counts: number[], sum: number) => {
+    if (poolIndex === pool.length - 1) {
+      const finalCounts = [...counts, remaining];
+      const finalSum = sum + pool[poolIndex].coefficient * remaining;
+      const deviation = Math.abs(finalSum - target);
+      const bigCount = finalCounts[finalCounts.length - 1];
+      const better = deviation < bestDeviation - COEFFICIENT_EPSILON
+        || (Math.abs(deviation - bestDeviation) <= COEFFICIENT_EPSILON
+          && (finalSum < bestSum - COEFFICIENT_EPSILON
+            || (Math.abs(finalSum - bestSum) <= COEFFICIENT_EPSILON
+              && bigCount < bestBigCount)));
+      if (better) {
+        bestDeviation = deviation;
+        bestSum = finalSum;
+        bestBigCount = bigCount;
+        bestCounts = finalCounts;
+      }
+      return;
     }
-  }
-  const shareCoefficient = basePalletSize.coefficient / shareDenominator;
-  const code = `${basePalletSize.value}_1_${shareDenominator}`;
-  return {
-    value: code,
-    label: `${code} — Доля 1/${shareDenominator} от ${basePalletSize.value} (коэффициент ${formatCoefficient(shareCoefficient)})`,
-    coefficient: shareCoefficient,
+    for (let take = 0; take <= remaining; take += 1) {
+      enumerate(
+        poolIndex + 1,
+        remaining - take,
+        [...counts, take],
+        sum + pool[poolIndex].coefficient * take,
+      );
+    }
   };
+
+  enumerate(0, ordersInGe, [], 0);
+
+  const sizes: PalletSize[] = [];
+  (bestCounts ?? []).forEach((boxCount, poolIndex) => {
+    for (let boxIndex = 0; boxIndex < boxCount; boxIndex += 1) {
+      sizes.push(pool[poolIndex]);
+    }
+  });
+  // Первым заказам — больший типоразмер.
+  return sizes.sort((a, b) => b.coefficient - a.coefficient);
 }
 
 const storeCities: Record<number, string> = {
@@ -150,14 +191,22 @@ export function getPalletSize(palletSizeCode: string): PalletSize | undefined {
   return palletSizes.find((size) => size.value === palletSizeCode);
 }
 
+// Базовая ставка за европаллету по маршруту «РЦ → город магазина».
+export function getRouteRate(
+  storeCode: string,
+  distributionCenter: DistributionCenter,
+): number | undefined {
+  const destination = getStoreCity(storeCode);
+  return destination ? routeRates[distributionCenter][destination] : undefined;
+}
+
 export function getTransportCost(
   storeCode: string,
   distributionCenter: DistributionCenter,
   palletSizeCode: string,
   geCount: number,
 ): number | undefined {
-  const destination = getStoreCity(storeCode);
-  const rate = destination ? routeRates[distributionCenter][destination] : undefined;
+  const rate = getRouteRate(storeCode, distributionCenter);
   const sizeCoefficient = getPalletSize(palletSizeCode)?.coefficient;
 
   if (rate === undefined || sizeCoefficient === undefined || !Number.isInteger(geCount) || geCount < 1) {
@@ -167,26 +216,10 @@ export function getTransportCost(
   return Math.round(geCount * sizeCoefficient * rate);
 }
 
-// Делит указанную стоимость между получателями пропорционально весам. Гарантия:
-// сумма по получателям в точности равна shareCost (расчёт в копейках, остаток
-// распределяется по первым получателям). Используется на двух уровнях:
-// сначала общая стоимость делится между ГЕ, затем стоимость каждой ГЕ —
-// между заказами, которые на ней размещены.
-export function getOrderCosts(
-  baseCost: number,
-  orderCoefficients: number[],
-): number[] {
-  const totalKopecks = Math.round(baseCost * 100);
-  const weightsSum = orderCoefficients.reduce((sum, coefficient) => sum + coefficient, 0);
-  if (orderCoefficients.length === 0 || weightsSum <= 0) {
-    return [];
-  }
-  const kopecks = orderCoefficients.map(
-    (coefficient) => Math.floor((totalKopecks * coefficient) / weightsSum + 1e-6),
-  );
-  let remainder = totalKopecks - kopecks.reduce((sum, value) => sum + value, 0);
-  for (let index = 0; remainder > 0; index = (index + 1) % kopecks.length, remainder -= 1) {
-    kopecks[index] += 1;
-  }
-  return kopecks.map((value) => value / 100);
+// Стоимость одного заказа: коэффициент его типоразмера × ставка маршрута.
+// Сумма по заказам может отличаться от стоимости booked ГЕ: если заказы дробятся
+// больше чем на 3 коробки, дробление выходит дороже целой ГЕ — это показывается
+// отдельным предупреждением, а не скрыто выравниванием суммы.
+export function getOrderCostForCoefficient(rate: number, coefficient: number): number {
+  return Math.round(rate * coefficient * 100) / 100;
 }
