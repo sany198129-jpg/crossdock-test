@@ -7,6 +7,8 @@ import {
   getStoreCity,
   getPalletSize,
   getTransportCost,
+  getOrderPalletSize,
+  getOrderCosts,
   isDistributionCenter,
   palletSizes,
   type DistributionCenter,
@@ -33,7 +35,12 @@ type LabelData = {
   labelTotal: number;
   geNumber: number;
   geTotal: number;
-  orderGeShare: string;
+  orderShareText: string;
+  orderShareFraction: string;
+  orderPalletSizeCode: string;
+  orderPalletSizeLabel: string;
+  orderPalletSizeCoefficient: number;
+  orderCost: number;
 };
 
 const formatDate = (date: string) => {
@@ -41,9 +48,13 @@ const formatDate = (date: string) => {
   return `${day}.${month}.${year.slice(-2)}`;
 };
 
+const formatCost = (value: number) =>
+  new Intl.NumberFormat('ru-RU', { minimumFractionDigits: 0, maximumFractionDigits: 2 }).format(value);
+
 export default function CastdocsPage() {
   const [submissionMessage, setSubmissionMessage] = useState('');
   const [labels, setLabels] = useState<LabelData[]>([]);
+  const [baseCost, setBaseCost] = useState<number | null>(null);
   const [selectedStoreCode, setSelectedStoreCode] = useState('');
   const [distributionCenter, setDistributionCenter] = useState<DistributionCenter | ''>('');
   const [palletSizeCode, setPalletSizeCode] = useState('');
@@ -176,9 +187,13 @@ export default function CastdocsPage() {
       const currentGeOrders = assembly ? orders.slice(orderIndex, orderIndex + ordersInGe) : orders;
       orderIndex += ordersInGe;
 
+      // Заказам присваивается типоразмер, равный их доле на этом ГЕ
+      // (целое ГЕ → базовый типоразмер; 1/2 → PAL_HALF; 1/3 → PAL_THIRD и т.д.).
+      const orderPalletSize = getOrderPalletSize(selectedPalletSize, ordersInGe);
+
       currentGeOrders.forEach((orderNumber, orderPosition) => {
         const labelNumber = orderPosition + 1;
-        const labelCode = `${storeCode}-${supplierCode}-${orderNumber}--${geIndex + 1}-${palletSizeCode}`;
+        const labelCode = `${storeCode}-${supplierCode}-${orderNumber}--${geIndex + 1}-${orderPalletSize.value}`;
 
         generatedLabels.push({
           storeCode,
@@ -197,13 +212,29 @@ export default function CastdocsPage() {
           labelTotal: currentGeOrders.length,
           geNumber: geIndex + 1,
           geTotal: geCount,
-          orderGeShare: currentGeOrders.length === 1 ? '1 ГЕ' : `1/${currentGeOrders.length} ГЕ`,
+          orderShareText: ordersInGe === 1 ? '1 ГЕ' : `1/${ordersInGe} ГЕ`,
+          orderShareFraction: `1/${ordersInGe}`,
+          orderPalletSizeCode: orderPalletSize.value,
+          orderPalletSizeLabel: orderPalletSize.label,
+          orderPalletSizeCoefficient: orderPalletSize.coefficient,
+          orderCost: 0,
         });
       });
     }
 
+    // Разбивка стоимости по заказам: сумма строго равна базовой стоимости перевозки
+    // и не может стать меньше её.
+    const orderCosts = getOrderCosts(
+      cost,
+      generatedLabels.map((label) => label.orderPalletSizeCoefficient),
+    );
+    orderCosts.forEach((value, index) => {
+      generatedLabels[index].orderCost = value;
+    });
+
     barcodeRefs.current = [];
     setLabels(generatedLabels);
+    setBaseCost(cost);
     setSubmissionMessage(
       `Сформировано этикеток: ${generatedLabels.length}. Нумерация заказов указана внутри каждой ГЕ.`,
     );
@@ -375,6 +406,24 @@ export default function CastdocsPage() {
               <h2 id="label-title">Предпросмотр этикеток ({labels.length})</h2>
               <button type="button" onClick={() => window.print()}>Печать / Сохранить в PDF</button>
             </div>
+            <div className={styles.costSummary}>
+              <h3>Разбивка стоимости по заказам</h3>
+              <ul>
+                {labels.map((label) => (
+                  <li key={`${label.labelCode}-${label.labelNumber}-cost`}>
+                    <span>
+                      Заказ {label.orderNumber} · ГЕ №{label.geNumber} · {label.orderPalletSizeCode}
+                    </span>
+                    <strong>{formatCost(label.orderCost)} ₽</strong>
+                  </li>
+                ))}
+              </ul>
+              <p className={styles.costSummaryTotal}>
+                Итого по заказам: {formatCost(labels.reduce((sum, label) => sum + label.orderCost, 0))} ₽ — равно базовой
+                стоимости перевозки ({baseCost !== null ? formatCost(baseCost) : 0} ₽); сумма по заказам не может
+                быть меньше базовой.
+              </p>
+            </div>
             {labels.map((label, index) => (
             <article className={styles.shippingLabel} key={`${label.labelCode}-${label.labelNumber}`}>
               <h2 className={styles.labelBrand}>Кросс-док</h2>
@@ -385,7 +434,9 @@ export default function CastdocsPage() {
               <p className={styles.geSequence}>
                 ГЕ №{label.geNumber} из {label.geTotal} в поставке
               </p>
-              <p className={styles.geSequence}>Заказ занимает {label.orderGeShare}</p>
+              <p className={styles.geSequence}>
+                Типоразмер заказа: {label.orderPalletSizeCode} ({label.orderShareText})
+              </p>
               <svg
                 ref={(element) => { barcodeRefs.current[index] = element; }}
                 className={styles.barcode}
@@ -431,15 +482,19 @@ export default function CastdocsPage() {
                     <td>{label.labelNumber} из {label.labelTotal}</td>
                   </tr>
                   <tr>
-                    <th>Доля ГЕ этого заказа</th>
+                    <th>Типоразмер заказа</th>
                     <td>
-                      {label.orderGeShare}
-                      {label.labelTotal > 1 && '; доли заказов на паллете в сумме составляют 1 ГЕ'}
+                      {label.orderPalletSizeLabel}
+                      {label.labelTotal === 1 && ' (целое ГЕ)'}
                     </td>
                   </tr>
                   <tr>
                     <th>Типоразмер паллет</th>
                     <td>{label.palletSizeLabel}</td>
+                  </tr>
+                  <tr>
+                    <th>Стоимость перевозки заказа</th>
+                    <td>{formatCost(label.orderCost)} ₽</td>
                   </tr>
                 </tbody>
               </table>
