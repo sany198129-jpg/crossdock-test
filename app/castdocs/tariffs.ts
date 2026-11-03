@@ -38,24 +38,24 @@ const SPLIT_BOX_POOL = ['BOX_STD', 'BOX_L', 'BIG_BOX'];
 
 const COEFFICIENT_EPSILON = 1e-9;
 
-// Бесплатный бонус-типоразмер заказа — стимул брать крупные ГЕ: на ГЕ с
-// коэффициентом 1,2 и больше (PAL_FIN, PAL_MIX, PAL_LONG, PAL_PROF, PAL_XL)
-// можно разместить один заказ бесплатно при условии, что коробка весит не
-// больше 25 кг. Бонус не расходует коэффициент ГЕ (коэффициент 0) и стоит 0 ₽.
-// В справочник palletSizes типоразмер не входит намеренно: он не бывает
-// типоразмером ГЕ и никогда не подставляется автоподбором.
-export const BONUS_SIZE_CODE = 'BONUS';
+// Сборная поставка (дробление заказов на коробки) доступна только для
+// европаллеты: если выбран любой другой типоразмер ГЕ, дробить нельзя —
+// указывается только типоразмер каждого заказа, и каждый заказ тарифицируется
+// целиком по своему коэффициенту.
+export const ASSEMBLY_SIZE_CODE = 'PAL_STD';
 
-export const BONUS_SIZE: PalletSize = {
-  value: BONUS_SIZE_CODE,
-  label: 'BONUS — Бесплатная бонус-коробка, до 25 кг (на ГЕ от 1,2)',
-  coefficient: 0,
-  maxWeightKg: 25,
-};
+export function isAssemblyAllowed(geSize: PalletSize): boolean {
+  return geSize.value === ASSEMBLY_SIZE_CODE;
+}
 
+// Акция «бесплатная коробка»: на ГЕ с коэффициентом 1,2 и больше (PAL_FIN,
+// PAL_MIX, PAL_LONG, PAL_PROF, PAL_XL) к заказу можно добавить один бесплатный
+// заказ-коробку весом до 25 кг. Коробка тарифицируется как обычный BOX_STD
+// (реальный тариф по коэффициенту 0,3), а бесплатность оформляется скидкой
+// 100% с основанием акции — в счёте всегда видно, откуда взялся ноль.
 export const BONUS_MIN_GE_COEFFICIENT = 1.2;
 
-// ГЕ подходит для бесплатного бонус-заказа, если её коэффициент 1,2 и больше.
+// ГЕ подходит для акции, если её коэффициент 1,2 и больше.
 export function isBonusEligibleGe(geSize: PalletSize): boolean {
   return geSize.coefficient >= BONUS_MIN_GE_COEFFICIENT - COEFFICIENT_EPSILON;
 }
