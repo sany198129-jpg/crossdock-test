@@ -13,7 +13,6 @@ import {
   formatCoefficient,
   isDistributionCenter,
   isAssemblyAllowed,
-  isBonusEligibleGe,
   palletSizes,
   type DistributionCenter,
   type PalletSize,
@@ -44,12 +43,9 @@ type LabelData = {
   orderPalletSizeCode: string;
   orderPalletSizeLabel: string;
   orderPalletSizeCoefficient: number;
-  // Тариф до скидки, сумма скидки и сумма к оплате. Для обычных заказов
-  // скидка равна нулю, для акции «бесплатная коробка» скидка — 100% тарифа.
-  orderTariff: number;
-  orderDiscount: number;
+  // Стоимость перевозки заказа: коэффициент типоразмера × ставка маршрута.
+  // Нулевых и скидочных позиций нет — каждый заказ тарифицируется полностью.
   orderCost: number;
-  orderPromo: boolean;
 };
 
 type OrderPlanRow = {
@@ -60,21 +56,7 @@ type OrderPlanRow = {
   ordersInGe: number;
   suggested: PalletSize;
   chosen: PalletSize;
-  // Бесплатная коробка по акции: реальный тариф BOX_STD + скидка 100%.
-  promo?: boolean;
 };
-
-// Данные бесплатной коробки по акции на конкретной ГЕ: номер заказа и вес.
-type PromoChoice = {
-  orderNumber: string;
-  weight: string;
-};
-
-// Бесплатная коробка по акции тарифицируется как обычный BOX_STD: у неё
-// реальный коэффициент 0,3 и реальный тариф, а «бесплатность» — скидка 100%
-// с основанием акции, видимая в разбивке стоимости и на этикетке.
-const PROMO_BOX_SIZE = getPalletSize('BOX_STD')!;
-const PROMO_MAX_WEIGHT_KG = PROMO_BOX_SIZE.maxWeightKg ?? 25;
 
 // Типоразмер заказа по коду справочника.
 const resolveOrderSize = (code: string): PalletSize | undefined => getPalletSize(code);
@@ -90,7 +72,6 @@ const buildOrderPlan = (
   basePalletSize: PalletSize,
   assembly: boolean,
   choices: Record<string, string>,
-  promoByGe: Record<number, PromoChoice> = {},
 ): OrderPlanRow[] => {
   if (!Number.isInteger(geCount) || geCount < 1 || orders.length === 0) {
     return [];
@@ -99,36 +80,21 @@ const buildOrderPlan = (
   if (!assembly) {
     // Несборная поставка: дробления нет — одна ГЕ несёт один заказ. Типоразмер
     // каждого заказа по умолчанию равен типоразмеру ГЕ и может быть изменён
-    // вручную; каждый заказ тарифицируется целиком по своему коэффициенту.
-    // На ГЕ от 1,2 евро к заказу можно добавить бесплатную коробку по акции
-    // (реальный тариф BOX_STD + скидка 100% с основанием акции).
+    // вручную; каждый заказ тарифицируется целиком по своему коэффициенту,
+    // без нулевых и бесплатных позиций.
     for (let geIndex = 0; geIndex < geCount; geIndex += 1) {
       const orderNumber = orders[geIndex] ?? '';
       const key = `${geIndex}:${orderNumber}`;
       const override = choices[key] ? resolveOrderSize(choices[key]) : undefined;
-      const promo = promoByGe[geIndex + 1];
-      const ordersInGe = promo ? 2 : 1;
       rows.push({
         key,
         orderNumber,
         geNumber: geIndex + 1,
         positionInGe: 1,
-        ordersInGe,
+        ordersInGe: 1,
         suggested: basePalletSize,
         chosen: override ?? basePalletSize,
       });
-      if (promo) {
-        rows.push({
-          key: `promo:${geIndex + 1}:${promo.orderNumber.trim()}`,
-          orderNumber: promo.orderNumber.trim(),
-          geNumber: geIndex + 1,
-          positionInGe: 2,
-          ordersInGe,
-          suggested: PROMO_BOX_SIZE,
-          chosen: PROMO_BOX_SIZE,
-          promo: true,
-        });
-      }
     }
     return rows;
   }
@@ -180,10 +146,6 @@ export default function CastdocsPage() {
   // паллет): при смене любого из них старые выборы перестают применяться, и
   // автоподстановка по ГЕ действует заново — без сброса состояния в effect.
   const [orderSizeChoicesByContext, setOrderSizeChoicesByContext] = useState<Record<string, Record<string, string>>>({});
-  // Бесплатные коробки по акции (номер заказа + вес на каждую ГЕ) хранятся по
-  // тому же контексту, что и ручные выборы типоразмеров: при смене поставки
-  // старые значения перестают применяться.
-  const [promoByContext, setPromoByContext] = useState<Record<string, Record<number, PromoChoice>>>({});
   const barcodeRefs = useRef<Array<SVGSVGElement | null>>([]);
   const labelRef = useRef<HTMLElement>(null);
   const selectedStoreCity = getStoreCity(selectedStoreCode);
@@ -222,15 +184,12 @@ export default function CastdocsPage() {
   const assemblyAllowed = isAssemblyAllowed(planBasePalletSize);
   const isAssembly = assemblyAllowed && assemblyMode !== 'no';
   const orderSizeChoices = orderSizeChoicesByContext[choicesContext] ?? {};
-  const promoEligible = !isAssembly && isBonusEligibleGe(planBasePalletSize);
-  const activePromoChoices = promoEligible ? promoByContext[choicesContext] ?? {} : {};
   const planRows = buildOrderPlan(
     parsedOrders,
     Number(geCount),
     planBasePalletSize,
     isAssembly,
     orderSizeChoices,
-    activePromoChoices,
   );
   const geSummaries = isAssembly ? (() => {
     const map = new Map<number, { sum: number; count: number }>();
@@ -260,29 +219,6 @@ export default function CastdocsPage() {
         return { geNumber, text, over };
       });
   })() : [];
-  // Проверка бесплатных коробок по акции: номер заказа заполнен и не совпадает
-  // с обычными заказами поставки, вес коробки от 0,1 до 25 кг.
-  const promoProblemsByGe = (() => {
-    const problems = new Map<number, string[]>();
-    Object.entries(activePromoChoices).forEach(([geRaw, promo]) => {
-      const geNumber = Number(geRaw);
-      const list: string[] = [];
-      const orderNumber = promo.orderNumber.trim();
-      if (!orderNumber) {
-        list.push('укажите номер заказа');
-      } else if (parsedOrders.includes(orderNumber)) {
-        list.push(`номер ${orderNumber} уже есть среди заказов поставки`);
-      }
-      const weight = Number(promo.weight);
-      if (promo.weight.trim() === '' || !Number.isFinite(weight) || weight <= 0 || weight > PROMO_MAX_WEIGHT_KG) {
-        list.push(`вес коробки от 0,1 до ${PROMO_MAX_WEIGHT_KG} кг`);
-      }
-      if (list.length > 0) {
-        problems.set(geNumber, list);
-      }
-    });
-    return problems;
-  })();
   const transportCost = selectedStoreCity && distributionCenter && geCount
     ? getTransportCost(
       selectedStoreCode,
@@ -379,50 +315,33 @@ export default function CastdocsPage() {
     // по типоразмеру ГЕ (автоподбор коробками: 2 заказа → 0,6 + 0,4 = 1,0;
     // 3 заказа → 0,4 + 0,3 + 0,3 = 1,0; 4 и больше → 0,3 × N — уже дороже паллеты)
     // и мог быть изменён поставщиком в окне номеров заказов.
-    const plan = buildOrderPlan(orders, geCount, selectedPalletSize, assembly, orderSizeChoices, activePromoChoices);
+    const plan = buildOrderPlan(orders, geCount, selectedPalletSize, assembly, orderSizeChoices);
 
-    const firstPromoProblem = Array.from(promoProblemsByGe.entries())[0];
-    if (firstPromoProblem) {
-      const [geNumber, problems] = firstPromoProblem;
-      setLabels([]);
-      setSubmissionMessage(`Бесплатная коробка по акции (ГЕ №${geNumber}): ${problems.join('; ')}.`);
-      return;
-    }
-
-    const generatedLabels: LabelData[] = plan.map((row) => {
-      const tariff = getOrderCostForCoefficient(rate, row.chosen.coefficient);
-      const promo = Boolean(row.promo);
-      return {
-        storeCode,
-        distributionCenter: selectedCenter,
-        storeCity,
-        supplierCode,
-        assembly: assembly ? 'Да' : 'Нет',
-        orderNumber: row.orderNumber,
-        palletSizeLabel: selectedPalletSize.label,
-        weight: String(formData.get('ves-gruza') ?? '').trim(),
-        temperatureMode: formData.get('temp-rezim') === 'yes' ? 'Да' : 'Нет',
-        rcDate,
-        storeDate,
-        labelCode: `${storeCode}-${supplierCode}-${row.orderNumber}--${row.geNumber}-${row.chosen.value}`,
-        labelNumber: row.positionInGe,
-        labelTotal: row.ordersInGe,
-        geNumber: row.geNumber,
-        geTotal: geCount,
-        orderShareText: promo
-          ? `акция: коробка до 25 кг, тариф ${formatCost(tariff)} ₽, скидка 100%`
-          : row.ordersInGe === 1
-            ? 'целое ГЕ'
-            : `коэффициент ${formatCoefficient(row.chosen.coefficient)}`,
-        orderPalletSizeCode: row.chosen.value,
-        orderPalletSizeLabel: row.chosen.label,
-        orderPalletSizeCoefficient: row.chosen.coefficient,
-        orderTariff: tariff,
-        orderDiscount: promo ? tariff : 0,
-        orderCost: promo ? 0 : tariff,
-        orderPromo: promo,
-      };
-    });
+    const generatedLabels: LabelData[] = plan.map((row) => ({
+      storeCode,
+      distributionCenter: selectedCenter,
+      storeCity,
+      supplierCode,
+      assembly: assembly ? 'Да' : 'Нет',
+      orderNumber: row.orderNumber,
+      palletSizeLabel: selectedPalletSize.label,
+      weight: String(formData.get('ves-gruza') ?? '').trim(),
+      temperatureMode: formData.get('temp-rezim') === 'yes' ? 'Да' : 'Нет',
+      rcDate,
+      storeDate,
+      labelCode: `${storeCode}-${supplierCode}-${row.orderNumber}--${row.geNumber}-${row.chosen.value}`,
+      labelNumber: row.positionInGe,
+      labelTotal: row.ordersInGe,
+      geNumber: row.geNumber,
+      geTotal: geCount,
+      orderShareText: row.ordersInGe === 1
+        ? 'целое ГЕ'
+        : `коэффициент ${formatCoefficient(row.chosen.coefficient)}`,
+      orderPalletSizeCode: row.chosen.value,
+      orderPalletSizeLabel: row.chosen.label,
+      orderPalletSizeCoefficient: row.chosen.coefficient,
+      orderCost: getOrderCostForCoefficient(rate, row.chosen.coefficient),
+    }));
 
     barcodeRefs.current = [];
     setLabels(generatedLabels);
@@ -445,8 +364,8 @@ export default function CastdocsPage() {
           <p>
             Шаг 1 — выберите грузовые единицы (типоразмер и количество ГЕ; сборная — только для
             европаллеты PAL_STD), шаг 2 — добавьте заказы: в несборной поставке одна ГЕ несёт один
-            заказ, в сборной заказы дробятся по европаллете. На ГЕ от 1,2 евро действует акция —
-            бесплатная коробка до 25 кг со скидкой 100% в счёте.
+            заказ, в сборной заказы дробятся по европаллете. Каждый заказ тарифицируется по
+            коэффициенту своего типоразмера — счетов с нулевой стоимостью нет.
           </p>
         </aside>
 
@@ -559,13 +478,6 @@ export default function CastdocsPage() {
                     ? 'Типоразмеры заказов — дробление европаллеты, при необходимости измените'
                     : 'Несборная поставка: одна ГЕ — один заказ. Укажите типоразмер каждого заказа'}
                 </span>
-                {promoEligible && (
-                  <p className={styles.ordersGeHint}>
-                    Акция: на каждой ГЕ от 1,2 евро можно добавить один бесплатный заказ-коробку
-                    до 25 кг. Коробка тарифицируется как BOX_STD, а скидка 100% с основанием
-                    акции будет видна в разбивке стоимости — без «нулевых» позиций в счёте.
-                  </p>
-                )}
                 {planRows.map((row) => {
                   return (
                     <label className={styles.ordersRow} key={row.key}>
@@ -592,103 +504,13 @@ export default function CastdocsPage() {
                         ))}
                       </select>
                       <span className={styles.ordersRowCoef}>
-                        {row.promo
-                          ? 'по акции: скидка 100%'
-                          : row.chosen.value === row.suggested.value
-                            ? `коэф. ${formatCoefficient(row.chosen.coefficient)}`
-                            : 'изменён вручную'}
+                        {row.chosen.value === row.suggested.value
+                          ? `коэф. ${formatCoefficient(row.chosen.coefficient)}`
+                          : 'изменён вручную'}
                       </span>
-                      {promoEligible && !row.promo && (
-                        <span className={styles.promoBox}>
-                          <span className={styles.promoToggle}>
-                            <input
-                              type="checkbox"
-                              checked={Boolean(activePromoChoices[row.geNumber])}
-                              aria-label={`Добавить бесплатную коробку по акции на ГЕ №${row.geNumber}`}
-                              onChange={(event) => {
-                                setPromoByContext((previous) => {
-                                  const current = { ...(previous[choicesContext] ?? {}) };
-                                  if (event.target.checked) {
-                                    current[row.geNumber] = { orderNumber: '', weight: '' };
-                                  } else {
-                                    delete current[row.geNumber];
-                                  }
-                                  return { ...previous, [choicesContext]: current };
-                                });
-                                setSubmissionMessage('');
-                              }}
-                            />
-                            Бесплатная коробка по акции (до 25 кг)
-                          </span>
-                          {activePromoChoices[row.geNumber] && (
-                            <>
-                              <input
-                                className={promoProblemsByGe.has(row.geNumber)
-                                  ? `${styles.bonusWeightInput} ${styles.bonusWeightInputInvalid} ${styles.promoOrderInput}`
-                                  : `${styles.bonusWeightInput} ${styles.promoOrderInput}`}
-                                type="text"
-                                placeholder="Номер бесплатного заказа"
-                                aria-label={`Номер бесплатного заказа-коробки на ГЕ №${row.geNumber}`}
-                                value={activePromoChoices[row.geNumber].orderNumber}
-                                onChange={(event) => {
-                                  const orderNumber = event.target.value;
-                                  setPromoByContext((previous) => ({
-                                    ...previous,
-                                    [choicesContext]: {
-                                      ...(previous[choicesContext] ?? {}),
-                                      [row.geNumber]: {
-                                        ...(previous[choicesContext] ?? {})[row.geNumber],
-                                        orderNumber,
-                                      },
-                                    },
-                                  }));
-                                  setSubmissionMessage('');
-                                }}
-                              />
-                              <input
-                                className={promoProblemsByGe.has(row.geNumber)
-                                  ? `${styles.bonusWeightInput} ${styles.bonusWeightInputInvalid}`
-                                  : styles.bonusWeightInput}
-                                type="number"
-                                min="0.1"
-                                max={PROMO_MAX_WEIGHT_KG}
-                                step="any"
-                                placeholder="Вес, кг"
-                                aria-label={`Вес коробки по акции на ГЕ №${row.geNumber}, кг`}
-                                value={activePromoChoices[row.geNumber].weight}
-                                onChange={(event) => {
-                                  const weight = event.target.value;
-                                  setPromoByContext((previous) => ({
-                                    ...previous,
-                                    [choicesContext]: {
-                                      ...(previous[choicesContext] ?? {}),
-                                      [row.geNumber]: {
-                                        ...(previous[choicesContext] ?? {})[row.geNumber],
-                                        weight,
-                                      },
-                                    },
-                                  }));
-                                  setSubmissionMessage('');
-                                }}
-                              />
-                              <span className={styles.ordersRowCoef}>
-                                номер заказа и вес коробки, до 25 кг
-                              </span>
-                            </>
-                          )}
-                        </span>
-                      )}
                     </label>
                   );
                 })}
-                {promoProblemsByGe.size > 0 && (
-                  <p className={`${styles.ordersGeHint} ${styles.ordersGeHintOver}`} role="alert">
-                    Проверьте бесплатные коробки по акции:{' '}
-                    {Array.from(promoProblemsByGe.entries())
-                      .map(([geNumber, problems]) => `ГЕ №${geNumber} — ${problems.join('; ')}`)
-                      .join('; ')}.
-                  </p>
-                )}
                 {!isAssembly && Number(geCount) >= 1 && parsedOrders.length !== Number(geCount) && (
                   <p className={`${styles.ordersGeHint} ${styles.ordersGeHintOver}`} role="alert">
                     Несборная поставка: дробления нет, одна ГЕ несёт один заказ. Сейчас заказов —{' '}
@@ -768,7 +590,7 @@ export default function CastdocsPage() {
           <button
             className={styles.submitButton}
             type="submit"
-            disabled={weightWarning || promoProblemsByGe.size > 0}
+            disabled={weightWarning}
           >
             Сформировать этикетку
           </button>
@@ -793,47 +615,30 @@ export default function CastdocsPage() {
                   <li key={`${label.labelCode}-${label.labelNumber}-cost`}>
                     <span>
                       Заказ {label.orderNumber} · ГЕ №{label.geNumber} · {label.orderPalletSizeCode}
-                      {label.orderPromo && ' (акция)'}
                     </span>
-                    <strong>
-                      {label.orderPromo
-                        ? `тариф ${formatCost(label.orderTariff)} ₽ · скидка −100% · итого 0 ₽`
-                        : `${formatCost(label.orderCost)} ₽`}
-                    </strong>
+                    <strong>{formatCost(label.orderCost)} ₽</strong>
                   </li>
                 ))}
               </ul>
-              {(() => {
-                const discount = labels.reduce((sum, label) => sum + label.orderDiscount, 0);
-                if (discount <= 0) {
-                  return null;
-                }
-                return (
-                  <p className={styles.costSummaryTotal}>
-                    Скидка по акции «бесплатная коробка до 25 кг на ГЕ от 1,2 евро»:{' '}
-                    −{formatCost(discount)} ₽
-                  </p>
-                );
-              })()}
               <p className={styles.costSummaryTotal}>
-                Итого к оплате по заказам: {formatCost(labels.reduce((sum, label) => sum + label.orderCost, 0))} ₽
+                Итого по заказам: {formatCost(labels.reduce((sum, label) => sum + label.orderCost, 0))} ₽
               </p>
               <p className={styles.costSummaryTotal}>
                 Стоимость перевозки ({labels[0].geTotal} ГЕ · {labels[0].palletSizeLabel.split('—')[0].trim()}):{' '}
                 {baseCost !== null ? formatCost(baseCost) : 0} ₽
               </p>
               {(() => {
-                const tariffsKopecks = labels.reduce(
-                  (sum, label) => sum + Math.round(label.orderTariff * 100),
+                const ordersKopecks = labels.reduce(
+                  (sum, label) => sum + Math.round(label.orderCost * 100),
                   0,
                 );
                 const baseKopecks = baseCost !== null ? Math.round(baseCost * 100) : 0;
-                const difference = tariffsKopecks - baseKopecks;
+                const difference = ordersKopecks - baseKopecks;
                 const assemblyShipment = labels[0].assembly === 'Да';
                 if (difference === 0) {
                   return (
                     <p className={styles.costSummaryHint}>
-                      Сумма тарифов по заказам равна стоимости перевозки.
+                      Сумма по заказам равна стоимости перевозки.
                     </p>
                   );
                 }
@@ -842,15 +647,15 @@ export default function CastdocsPage() {
                     <p className={`${styles.costSummaryHint} ${styles.costSummaryHintOver}`}>
                       {assemblyShipment
                         ? `Дробление дороже целых ГЕ на ${formatCost(difference / 100)} ₽ — поставщику выгоднее укрупнить типоразмеры заказов (например, взять паллету вместо коробок).`
-                        : `Сумма тарифов заказов больше стоимости выбранных ГЕ на ${formatCost(difference / 100)} ₽ — проверьте типоразмеры заказов.`}
+                        : `Сумма по заказам больше стоимости выбранных ГЕ на ${formatCost(difference / 100)} ₽ — проверьте типоразмеры заказов.`}
                     </p>
                   );
                 }
                 return (
                   <p className={styles.costSummaryHint}>
                     {assemblyShipment
-                      ? `Сумма тарифов по заказам меньше стоимости перевозки на ${formatCost(-difference / 100)} ₽ (недогруз ГЕ).`
-                      : `Сумма тарифов заказов меньше стоимости выбранных ГЕ на ${formatCost(-difference / 100)} ₽ — типоразмеры заказов изменены вручную.`}
+                      ? `Сумма по заказам меньше стоимости перевозки на ${formatCost(-difference / 100)} ₽ (недогруз ГЕ).`
+                      : `Сумма по заказам меньше стоимости выбранных ГЕ на ${formatCost(-difference / 100)} ₽ — типоразмеры заказов изменены вручную.`}
                   </p>
                 );
               })()}
@@ -925,11 +730,7 @@ export default function CastdocsPage() {
                   </tr>
                   <tr>
                     <th>Стоимость перевозки заказа</th>
-                    <td>
-                      {label.orderPromo
-                        ? `0 ₽ (тариф ${formatCost(label.orderTariff)} ₽, скидка 100% — акция «бесплатная коробка до 25 кг на ГЕ от 1,2 евро»)`
-                        : `${formatCost(label.orderCost)} ₽`}
-                    </td>
+                    <td>{formatCost(label.orderCost)} ₽</td>
                   </tr>
                 </tbody>
               </table>

@@ -454,61 +454,6 @@
   font-weight: 700;
 }
 
-.bonusWeight {
-  grid-column: 1 / -1;
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
-
-.bonusWeightInput {
-  width: 130px;
-  min-height: 40px;
-  padding: 0 11px;
-  border: 2px solid #d5d7d7;
-  border-radius: 6px;
-  color: #333;
-  background: #fff;
-  font: inherit;
-  font-size: 15px;
-}
-
-.bonusWeightInput:focus {
-  border-color: #999;
-  outline: 2px solid #df092f22;
-}
-
-.bonusWeightInputInvalid {
-  border-color: #df092f;
-}
-
-/* Акция «бесплатная коробка»: чекбокс, номер заказа и вес коробки. */
-.promoBox {
-  grid-column: 1 / -1;
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 10px;
-}
-
-.promoToggle {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  font-size: 14px;
-  color: #333;
-}
-
-.promoToggle input[type='checkbox'] {
-  width: 18px;
-  height: 18px;
-  accent-color: #df092f;
-}
-
-.promoOrderInput {
-  width: 190px;
-}
-
 .labelSection {
   max-width: 860px;
   margin: 40px auto 60px 0;

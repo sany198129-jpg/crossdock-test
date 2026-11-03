@@ -48,18 +48,6 @@ export function isAssemblyAllowed(geSize: PalletSize): boolean {
   return geSize.value === ASSEMBLY_SIZE_CODE;
 }
 
-// Акция «бесплатная коробка»: на ГЕ с коэффициентом 1,2 и больше (PAL_FIN,
-// PAL_MIX, PAL_LONG, PAL_PROF, PAL_XL) к заказу можно добавить один бесплатный
-// заказ-коробку весом до 25 кг. Коробка тарифицируется как обычный BOX_STD
-// (реальный тариф по коэффициенту 0,3), а бесплатность оформляется скидкой
-// 100% с основанием акции — в счёте всегда видно, откуда взялся ноль.
-export const BONUS_MIN_GE_COEFFICIENT = 1.2;
-
-// ГЕ подходит для акции, если её коэффициент 1,2 и больше.
-export function isBonusEligibleGe(geSize: PalletSize): boolean {
-  return geSize.coefficient >= BONUS_MIN_GE_COEFFICIENT - COEFFICIENT_EPSILON;
-}
-
 // Коэффициент для показа: запятая как десятичный разделитель, без лишних нулей.
 export function formatCoefficient(value: number): string {
   return value.toFixed(4).replace(/0+$/, '').replace(/\.$/, '').replace('.', ',');
