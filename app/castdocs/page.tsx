@@ -243,13 +243,18 @@ export default function CastdocsPage() {
         return;
       }
 
-      JsBarcode(barcode, label.labelCode, {
-        format: 'CODE128',
-        displayValue: false,
-        height: 56,
-        margin: 0,
-        width: 1.5,
-      });
+      try {
+        JsBarcode(barcode, label.labelCode, {
+          format: 'CODE128',
+          displayValue: false,
+          height: 56,
+          margin: 0,
+          width: 1.5,
+        });
+      } catch {
+        // Невалидная для CODE128 строка не должна «ронять» всю страницу.
+        barcode.replaceChildren();
+      }
     });
     labelRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
   }, [labels]);
@@ -263,6 +268,18 @@ export default function CastdocsPage() {
       .split(/\r?\n/)
       .map((order) => order.trim())
       .filter(Boolean);
+    // Штрихкод CODE128 кодирует только латиницу, цифры и простые символы:
+    // кириллица в коде поставщика или номере заказа ломает генерацию этикетки
+    // и «роняет» страницу, поэтому такие значения отклоняются заранее.
+    const barcodeSafePattern = /^[A-Za-z0-9._-]+$/;
+    const invalidOrders = orders.filter((order) => !barcodeSafePattern.test(order));
+    if (!barcodeSafePattern.test(supplierCode) || invalidOrders.length > 0) {
+      setLabels([]);
+      setSubmissionMessage(
+        'Код поставщика и номера заказов должны состоять из латинских букв, цифр и символов - . _ без пробелов и кириллицы: стандарт штрихкода CODE128 не поддерживает другие символы.',
+      );
+      return;
+    }
     const geCount = Number(formData.get('num-ge'));
     const assembly = formData.get('delivery-type') === 'yes';
     const palletSizeCode = String(formData.get('palsize_id') || 'PAL_STD');
@@ -380,9 +397,14 @@ export default function CastdocsPage() {
                 required
               >
                 <option value="">Выберите код магазина</option>
-                {storeCodes.map((code) => (
-                  <option value={code} key={code}>{code}</option>
-                ))}
+                {storeCodes.map((code) => {
+                  const city = getStoreCity(String(code));
+                  return (
+                    <option value={code} key={code}>
+                      {city ? `${code} — ${city}` : String(code)}
+                    </option>
+                  );
+                })}
               </select>
             </label>
             <label className={styles.field}>
@@ -403,7 +425,13 @@ export default function CastdocsPage() {
             </label>
             <label className={styles.field}>
               <span>Код поставщика</span>
-              <input name="gruz-otp" type="text" required />
+              <input
+                name="gruz-otp"
+                type="text"
+                required
+                pattern="[A-Za-z0-9._-]+"
+                title="Латинские буквы, цифры и символы - . _ — кириллица не поддерживается штрихкодом CODE128"
+              />
             </label>
             <label className={styles.field}>
               <span>Сборная</span>
@@ -467,8 +495,9 @@ export default function CastdocsPage() {
                   setOrdersText(event.target.value);
                   setSubmissionMessage('');
                 }}
-                placeholder="Введите номер каждого заказа с новой строки"
+                placeholder="Введите номер каждого заказа с новой строки (латиница и цифры)"
                 required
+                title="Латинские буквы, цифры и символы - . _ — кириллица не поддерживается штрихкодом CODE128"
               />
             </label>
             {planRows.length > 0 && (
