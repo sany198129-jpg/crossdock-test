@@ -12,7 +12,10 @@ import {
   suggestOrderSizes,
   formatCoefficient,
   isDistributionCenter,
+  isBonusEligibleGe,
   palletSizes,
+  BONUS_SIZE,
+  BONUS_SIZE_CODE,
   type DistributionCenter,
   type PalletSize,
 } from './tariffs';
@@ -55,6 +58,34 @@ type OrderPlanRow = {
   chosen: PalletSize;
 };
 
+// Бесплатный типоразмер BONUS действует только при жёстких условиях: сборная
+// поставка, ГЕ с коэффициентом 1,2 и больше, не больше одного бонуса на ГЕ и
+// только как дополнение к обычным заказам (в ГЕ остаётся хотя бы один платный
+// заказ). Нарушенные бонусы отбрасываются к предложенному автоподбору.
+const sanitizeBonusChoices = (
+  rows: OrderPlanRow[],
+  basePalletSize: PalletSize,
+  assembly: boolean,
+): OrderPlanRow[] => {
+  const bonusAllowed = assembly && isBonusEligibleGe(basePalletSize);
+  const bonusTakenGe = new Set<number>();
+  return rows.map((row) => {
+    if (row.chosen.value !== BONUS_SIZE_CODE) {
+      return row;
+    }
+    if (bonusAllowed && row.ordersInGe >= 2 && !bonusTakenGe.has(row.geNumber)) {
+      bonusTakenGe.add(row.geNumber);
+      return row;
+    }
+    return { ...row, chosen: row.suggested };
+  });
+};
+
+// Типоразмер заказа по коду: сначала справочник, затем бесплатный BONUS — он
+// в palletSizes не входит, но поставщик может выбрать его вручную.
+const resolveOrderSize = (code: string): PalletSize | undefined =>
+  getPalletSize(code) ?? (code === BONUS_SIZE_CODE ? BONUS_SIZE : undefined);
+
 // Раскладка заказов по ГЕ с типоразмером каждого заказа. Используется и для
 // подсказки в форме, и при формировании этикеток — предложенные и фактические
 // типоразмеры всегда совпадают. В сборной поставке заказы распределяются по ГЕ
@@ -75,7 +106,7 @@ const buildOrderPlan = (
     // Несборная поставка: один заказ занимает каждое целое ГЕ.
     for (let geIndex = 0; geIndex < geCount; geIndex += 1) {
       const key = `0:${orders[0]}@${geIndex + 1}`;
-      const override = choices[key] ? getPalletSize(choices[key]) : undefined;
+      const override = choices[key] ? resolveOrderSize(choices[key]) : undefined;
       rows.push({
         key,
         orderNumber: orders[0],
@@ -86,7 +117,7 @@ const buildOrderPlan = (
         chosen: override ?? basePalletSize,
       });
     }
-    return rows;
+    return sanitizeBonusChoices(rows, basePalletSize, assembly);
   }
   const ordersPerGe = Math.floor(orders.length / geCount);
   const remainder = orders.length % geCount;
@@ -97,7 +128,7 @@ const buildOrderPlan = (
     for (let position = 0; position < ordersInGe; position += 1) {
       const orderNumber = orders[orderIndex];
       const key = `${orderIndex}:${orderNumber}`;
-      const override = choices[key] ? getPalletSize(choices[key]) : undefined;
+      const override = choices[key] ? resolveOrderSize(choices[key]) : undefined;
       rows.push({
         key,
         orderNumber,
@@ -110,7 +141,7 @@ const buildOrderPlan = (
       orderIndex += 1;
     }
   }
-  return rows;
+  return sanitizeBonusChoices(rows, basePalletSize, assembly);
 };
 
 const formatDate = (date: string) => {
@@ -136,6 +167,9 @@ export default function CastdocsPage() {
   // паллет): при смене любого из них старые выборы перестают применяться, и
   // автоподстановка по ГЕ действует заново — без сброса состояния в effect.
   const [orderSizeChoicesByContext, setOrderSizeChoicesByContext] = useState<Record<string, Record<string, string>>>({});
+  // Вес бонус-коробки (до 25 кг) хранится по тому же контексту, что и ручные
+  // выборы типоразмеров: при смене поставки старые значения перестают применяться.
+  const [bonusWeightsByContext, setBonusWeightsByContext] = useState<Record<string, Record<string, string>>>({});
   const barcodeRefs = useRef<Array<SVGSVGElement | null>>([]);
   const labelRef = useRef<HTMLElement>(null);
   const selectedStoreCity = getStoreCity(selectedStoreCode);
@@ -170,7 +204,10 @@ export default function CastdocsPage() {
   const ordersKey = parsedOrders.join('\n');
   const planBasePalletSize = selectedSize ?? getPalletSize('PAL_STD')!;
   const choicesContext = `${assemblyMode !== 'no' ? 'A' : 'S'}|${ordersKey}|${geCount}|${palletSizeCode}`;
+  const isAssembly = assemblyMode !== 'no';
   const orderSizeChoices = orderSizeChoicesByContext[choicesContext] ?? {};
+  const bonusWeights = bonusWeightsByContext[choicesContext] ?? {};
+  const bonusGeEligible = isAssembly && isBonusEligibleGe(planBasePalletSize);
   const planRows = buildOrderPlan(
     parsedOrders,
     Number(geCount),
@@ -206,6 +243,26 @@ export default function CastdocsPage() {
         return { geNumber, text, over };
       });
   })();
+  const bonusWeightValue = (row: OrderPlanRow): number | undefined => {
+    const raw = bonusWeights[row.key];
+    if (raw === undefined || raw.trim() === '') {
+      return undefined;
+    }
+    const value = Number(raw);
+    return Number.isFinite(value) && value > 0 ? value : undefined;
+  };
+  const isValidBonusWeight = (row: OrderPlanRow): boolean => {
+    const value = bonusWeightValue(row);
+    return value !== undefined && value <= (BONUS_SIZE.maxWeightKg ?? 25);
+  };
+  const invalidBonusRows = planRows.filter(
+    (row) => row.chosen.value === BONUS_SIZE_CODE && !isValidBonusWeight(row),
+  );
+  const bonusTakenGeNumbers = new Set(
+    planRows
+      .filter((row) => row.chosen.value === BONUS_SIZE_CODE)
+      .map((row) => row.geNumber),
+  );
   const transportCost = selectedStoreCity && distributionCenter && geCount
     ? getTransportCost(
       selectedStoreCode,
@@ -302,6 +359,17 @@ export default function CastdocsPage() {
     // и мог быть изменён поставщиком в окне номеров заказов.
     const plan = buildOrderPlan(orders, geCount, selectedPalletSize, assembly, orderSizeChoices);
 
+    const invalidBonusRow = plan.find(
+      (row) => row.chosen.value === BONUS_SIZE_CODE && !isValidBonusWeight(row),
+    );
+    if (invalidBonusRow) {
+      setLabels([]);
+      setSubmissionMessage(
+        `Для бонус-заказа ${invalidBonusRow.orderNumber} (ГЕ №${invalidBonusRow.geNumber}) укажите вес коробки от 0,1 до ${BONUS_SIZE.maxWeightKg ?? 25} кг.`,
+      );
+      return;
+    }
+
     const generatedLabels: LabelData[] = plan.map((row) => ({
       storeCode,
       distributionCenter: selectedCenter,
@@ -319,9 +387,11 @@ export default function CastdocsPage() {
       labelTotal: row.ordersInGe,
       geNumber: row.geNumber,
       geTotal: geCount,
-      orderShareText: row.ordersInGe === 1
-        ? 'целое ГЕ'
-        : `коэффициент ${formatCoefficient(row.chosen.coefficient)}`,
+      orderShareText: row.chosen.value === BONUS_SIZE_CODE
+        ? 'бесплатный бонус до 25 кг'
+        : row.ordersInGe === 1
+          ? 'целое ГЕ'
+          : `коэффициент ${formatCoefficient(row.chosen.coefficient)}`,
       orderPalletSizeCode: row.chosen.value,
       orderPalletSizeLabel: row.chosen.label,
       orderPalletSizeCoefficient: row.chosen.coefficient,
@@ -347,7 +417,9 @@ export default function CastdocsPage() {
         <aside className={styles.notice}>
           <span aria-hidden="true">📋</span>
           <p>
-            Заполните данные поставки, чтобы проверить расчёт стоимости и сформировать этикетки.
+            Шаг 1 — выберите грузовые единицы (типоразмер и количество ГЕ), шаг 2 — добавьте
+            заказы: система распределит их по ГЕ, подберёт типоразмеры и посчитает стоимость
+            каждого заказа.
           </p>
         </aside>
 
@@ -403,6 +475,36 @@ export default function CastdocsPage() {
                 <option value="no">Нет</option>
               </select>
             </label>
+            <p className={styles.stepTitle}>Шаг 1 · Грузовые единицы (ГЕ)</p>
+            <label className={styles.field}>
+              <span>Типоразмер ГЕ *</span>
+              <select
+                name="palsize_id"
+                value={palletSizeCode}
+                onChange={(event) => {
+                  setPalletSizeCode(event.target.value);
+                  setSubmissionMessage('');
+                }}
+              >
+                <option value="">-----</option>
+                {palletSizes.map((size) => (
+                  <option value={size.value} key={size.value}>{size.label}</option>
+                ))}
+              </select>
+            </label>
+            <label className={styles.field}>
+              <span>Количество ГЕ</span>
+              <input
+                name="num-ge"
+                type="number"
+                min="1"
+                step="1"
+                value={geCount}
+                onChange={(event) => setGeCount(event.target.value)}
+                required
+              />
+            </label>
+            <p className={styles.stepTitle}>Шаг 2 · Заказы</p>
             <label className={styles.field}>
               <span>Номера заказов (по одному в строке)</span>
               <textarea
@@ -422,37 +524,88 @@ export default function CastdocsPage() {
                 <span className={styles.ordersEditorTitle}>
                   Типоразмеры заказов — подставлены по типоразмеру ГЕ, при необходимости измените
                 </span>
-                {planRows.map((row) => (
-                  <label className={styles.ordersRow} key={row.key}>
-                    <span className={styles.ordersRowName}>
-                      Заказ {row.orderNumber} · ГЕ №{row.geNumber}
-                    </span>
-                    <select
-                      value={row.chosen.value}
-                      onChange={(event) => {
-                        const code = event.target.value;
-                        setOrderSizeChoicesByContext((previous) => ({
-                          ...previous,
-                          [choicesContext]: {
-                            ...(previous[choicesContext] ?? {}),
-                            [row.key]: code,
-                          },
-                        }));
-                      }}
-                    >
-                      {palletSizes.map((size) => (
-                        <option value={size.value} key={size.value}>
-                          {size.value} (коэф. {formatCoefficient(size.coefficient)})
-                        </option>
-                      ))}
-                    </select>
-                    <span className={styles.ordersRowCoef}>
-                      {row.chosen.value === row.suggested.value
-                        ? `коэф. ${formatCoefficient(row.chosen.coefficient)}`
-                        : 'изменён вручную'}
-                    </span>
-                  </label>
-                ))}
+                {bonusGeEligible && (
+                  <p className={styles.ordersGeHint}>
+                    На каждом таком ГЕ можно разместить один заказ бесплатно: выберите для него
+                    типоразмер BONUS и укажите вес коробки до 25 кг. Бонус не расходует
+                    коэффициент ГЕ.
+                  </p>
+                )}
+                {planRows.map((row) => {
+                  const bonusTakenHere = bonusTakenGeNumbers.has(row.geNumber)
+                    && row.chosen.value !== BONUS_SIZE_CODE;
+                  return (
+                    <label className={styles.ordersRow} key={row.key}>
+                      <span className={styles.ordersRowName}>
+                        Заказ {row.orderNumber} · ГЕ №{row.geNumber}
+                      </span>
+                      <select
+                        value={row.chosen.value}
+                        onChange={(event) => {
+                          const code = event.target.value;
+                          setOrderSizeChoicesByContext((previous) => ({
+                            ...previous,
+                            [choicesContext]: {
+                              ...(previous[choicesContext] ?? {}),
+                              [row.key]: code,
+                            },
+                          }));
+                        }}
+                      >
+                        {palletSizes.map((size) => (
+                          <option value={size.value} key={size.value}>
+                            {size.value} (коэф. {formatCoefficient(size.coefficient)})
+                          </option>
+                        ))}
+                        {bonusGeEligible && row.ordersInGe >= 2 && (
+                          <option value={BONUS_SIZE_CODE} disabled={bonusTakenHere}>
+                            {BONUS_SIZE_CODE} (бесплатно, до 25 кг){bonusTakenHere ? ' — уже есть на этом ГЕ' : ''}
+                          </option>
+                        )}
+                      </select>
+                      <span className={styles.ordersRowCoef}>
+                        {row.chosen.value === BONUS_SIZE_CODE
+                          ? 'бесплатно, 0 ₽'
+                          : row.chosen.value === row.suggested.value
+                            ? `коэф. ${formatCoefficient(row.chosen.coefficient)}`
+                            : 'изменён вручную'}
+                      </span>
+                      {row.chosen.value === BONUS_SIZE_CODE && (
+                        <span className={styles.bonusWeight}>
+                          <input
+                            className={invalidBonusRows.some((item) => item.key === row.key)
+                              ? `${styles.bonusWeightInput} ${styles.bonusWeightInputInvalid}`
+                              : styles.bonusWeightInput}
+                            type="number"
+                            min="0.1"
+                            max="25"
+                            step="any"
+                            placeholder="Вес, кг"
+                            aria-label={`Вес бонус-коробки заказа ${row.orderNumber}, кг`}
+                            value={bonusWeights[row.key] ?? ''}
+                            onChange={(event) => {
+                              const weight = event.target.value;
+                              setBonusWeightsByContext((previous) => ({
+                                ...previous,
+                                [choicesContext]: {
+                                  ...(previous[choicesContext] ?? {}),
+                                  [row.key]: weight,
+                                },
+                              }));
+                            }}
+                          />
+                          <span className={styles.ordersRowCoef}>вес коробки, до 25 кг</span>
+                        </span>
+                      )}
+                    </label>
+                  );
+                })}
+                {invalidBonusRows.length > 0 && (
+                  <p className={`${styles.ordersGeHint} ${styles.ordersGeHintOver}`} role="alert">
+                    Укажите вес бонус-коробки (от 0,1 до 25 кг):{' '}
+                    {invalidBonusRows.map((row) => `заказ ${row.orderNumber} (ГЕ №${row.geNumber})`).join('; ')}.
+                  </p>
+                )}
                 {geSummaries.map((summary) => (
                   <p
                     className={summary.over
@@ -465,34 +618,6 @@ export default function CastdocsPage() {
                 ))}
               </div>
             )}
-            <label className={styles.field}>
-              <span>Количество ГЕ</span>
-              <input
-                name="num-ge"
-                type="number"
-                min="1"
-                step="1"
-                value={geCount}
-                onChange={(event) => setGeCount(event.target.value)}
-                required
-              />
-            </label>
-            <label className={styles.field}>
-              <span>Типоразмер паллет *</span>
-              <select
-                name="palsize_id"
-                value={palletSizeCode}
-                onChange={(event) => {
-                  setPalletSizeCode(event.target.value);
-                  setSubmissionMessage('');
-                }}
-              >
-                <option value="">-----</option>
-                {palletSizes.map((size) => (
-                  <option value={size.value} key={size.value}>{size.label}</option>
-                ))}
-              </select>
-            </label>
             <label className={styles.field}>
               <span>E-mail поставщика</span>
               <input name="Email" type="email" required />
@@ -551,13 +676,17 @@ export default function CastdocsPage() {
             </label>
           </div>
 
-          <button className={styles.submitButton} type="submit" disabled={weightWarning}>
+          <button
+            className={styles.submitButton}
+            type="submit"
+            disabled={weightWarning || invalidBonusRows.length > 0}
+          >
             Сформировать этикетку
           </button>
           {submissionMessage && <p className={styles.formMessage} role="status">{submissionMessage}</p>}
 
           <p className={styles.palletNote}>
-            * Если типоразмер не выбран, автоматически используется PAL_STD
+            * Если типоразмер ГЕ не выбран, автоматически используется PAL_STD
             «Европалета стандарт, 800×1200 мм».
           </p>
         </form>

@@ -38,6 +38,28 @@ const SPLIT_BOX_POOL = ['BOX_STD', 'BOX_L', 'BIG_BOX'];
 
 const COEFFICIENT_EPSILON = 1e-9;
 
+// Бесплатный бонус-типоразмер заказа — стимул брать крупные ГЕ: на ГЕ с
+// коэффициентом 1,2 и больше (PAL_FIN, PAL_MIX, PAL_LONG, PAL_PROF, PAL_XL)
+// можно разместить один заказ бесплатно при условии, что коробка весит не
+// больше 25 кг. Бонус не расходует коэффициент ГЕ (коэффициент 0) и стоит 0 ₽.
+// В справочник palletSizes типоразмер не входит намеренно: он не бывает
+// типоразмером ГЕ и никогда не подставляется автоподбором.
+export const BONUS_SIZE_CODE = 'BONUS';
+
+export const BONUS_SIZE: PalletSize = {
+  value: BONUS_SIZE_CODE,
+  label: 'BONUS — Бесплатная бонус-коробка, до 25 кг (на ГЕ от 1,2)',
+  coefficient: 0,
+  maxWeightKg: 25,
+};
+
+export const BONUS_MIN_GE_COEFFICIENT = 1.2;
+
+// ГЕ подходит для бесплатного бонус-заказа, если её коэффициент 1,2 и больше.
+export function isBonusEligibleGe(geSize: PalletSize): boolean {
+  return geSize.coefficient >= BONUS_MIN_GE_COEFFICIENT - COEFFICIENT_EPSILON;
+}
+
 // Коэффициент для показа: запятая как десятичный разделитель, без лишних нулей.
 export function formatCoefficient(value: number): string {
   return value.toFixed(4).replace(/0+$/, '').replace(/\.$/, '').replace('.', ',');
